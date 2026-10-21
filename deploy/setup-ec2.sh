@@ -16,12 +16,19 @@ CONF_DIR="/etc/${APP_NAME}"
 
 echo "==> Instalando Java 21"
 if command -v dnf >/dev/null 2>&1; then
-	sudo dnf install -y java-21-amazon-corretto-headless curl
+	# Ojo: en Amazon Linux 2023 "curl" choca con "curl-minimal" (ya instalado);
+	# no lo agregamos como paquete.
+	sudo dnf install -y java-21-amazon-corretto-headless
 elif command -v apt-get >/dev/null 2>&1; then
 	sudo apt-get update -y
 	sudo apt-get install -y openjdk-21-jre-headless curl
 else
 	echo "ERROR: no reconozco el gestor de paquetes (dnf/apt-get)" >&2
+	exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+	echo "ERROR: falta curl en la instancia (lo usa el health check)" >&2
 	exit 1
 fi
 

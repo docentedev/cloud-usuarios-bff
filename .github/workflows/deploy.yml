@@ -1,0 +1,171 @@
+name: Deploy BFF
+
+# Flujo (git flow simplificado):
+#   feature/*  -> PR a develop  -> CI (.github/workflows/ci.yml)
+#   develop    -> PR a main     -> CI
+#   main / tag v*  -> este workflow -> deploy a la instancia EC2
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-bff-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (Java 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Compilar y empaquetar
+        run: ./gradlew clean bootJar --no-daemon -x test
+
+      - name: Publicar jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: bff-jar
+          path: build/libs/app.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy a EC2
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ vars.EC2_HOST }}:8080
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bff-jar
+          path: dist
+
+      - name: Validar configuración
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_USER: ${{ vars.EC2_USER }}
+          DB_URL: ${{ vars.DB_URL }}
+          DB_USERNAME: ${{ vars.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          COGNITO_REGION: ${{ vars.COGNITO_REGION }}
+          COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+          COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
+        run: |
+          faltan=0
+          for v in EC2_HOST EC2_USER DB_URL DB_USERNAME DB_PASSWORD \
+                   COGNITO_REGION COGNITO_USER_POOL_ID COGNITO_CLIENT_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Falta configurar $v en Settings > Secrets and variables > Actions"
+              faltan=1
+            fi
+          done
+          [ "$faltan" -eq 0 ] || exit 1
+
+      - name: Configurar SSH
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_USER: ${{ vars.EC2_USER }}
+          SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "::error::Falta el secreto EC2_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<EOF
+          Host bff
+            HostName $EC2_HOST
+            User $EC2_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Generar archivo de entorno
+        env:
+          DB_URL: ${{ vars.DB_URL }}
+          DB_USERNAME: ${{ vars.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          COGNITO_REGION: ${{ vars.COGNITO_REGION }}
+          COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+          COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
+        run: |
+          umask 077
+          cat > "$RUNNER_TEMP/bff.env" <<EOF
+          DB_URL=$DB_URL
+          DB_USERNAME=$DB_USERNAME
+          DB_PASSWORD=$DB_PASSWORD
+          COGNITO_REGION=$COGNITO_REGION
+          COGNITO_USER_POOL_ID=$COGNITO_USER_POOL_ID
+          COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID
+          EOF
+
+      - name: Subir artefactos
+        run: |
+          scp dist/app.jar bff:/tmp/cloud-usuarios-bff.jar
+          scp "$RUNNER_TEMP/bff.env" bff:/tmp/cloud-usuarios-bff.env
+
+      - name: Activar versión
+        run: |
+          ssh bff 'set -e
+            sudo install -d -m 755 /opt/cloud-usuarios-bff
+            sudo install -d -m 750 /etc/cloud-usuarios-bff
+
+            # respaldo para rollback
+            if [ -f /opt/cloud-usuarios-bff/app.jar ]; then
+              sudo cp -a /opt/cloud-usuarios-bff/app.jar /opt/cloud-usuarios-bff/app.jar.prev
+            fi
+
+            sudo install -m 644 -o cloudusuarios -g cloudusuarios \
+              /tmp/cloud-usuarios-bff.jar /opt/cloud-usuarios-bff/app.jar
+            sudo install -m 600 -o root -g root \
+              /tmp/cloud-usuarios-bff.env /etc/cloud-usuarios-bff/env
+            rm -f /tmp/cloud-usuarios-bff.jar /tmp/cloud-usuarios-bff.env
+
+            sudo systemctl restart cloud-usuarios-bff
+          '
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            code=$(ssh bff "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/usuarios || true")
+            # 401 sin token = la API está arriba y el filtro de Cognito responde
+            if [ "$code" = "401" ]; then
+              echo "Despliegue OK: /api/usuarios responde 401 sin token"
+              exit 0
+            fi
+            echo "Intento $i: HTTP '$code'"
+            sleep 3
+          done
+          echo "::error::La aplicación no respondió 401 en 90s"
+          ssh bff 'sudo journalctl -u cloud-usuarios-bff -n 80 --no-pager' || true
+          exit 1
+
+      - name: Rollback si falla
+        if: failure()
+        run: |
+          ssh bff 'if [ -f /opt/cloud-usuarios-bff/app.jar.prev ]; then
+            sudo install -m 644 -o cloudusuarios -g cloudusuarios \
+              /opt/cloud-usuarios-bff/app.jar.prev /opt/cloud-usuarios-bff/app.jar
+            sudo systemctl restart cloud-usuarios-bff
+            echo "Rollback aplicado"
+          else
+            echo "No hay versión previa para restaurar"
+          fi' || true
